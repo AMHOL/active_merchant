@@ -28,6 +28,33 @@ class PinTest < Test::Unit::TestCase
       source: :apple_pay
     )
 
+    @encrypted_apple_pay_card = NetworkTokenizationCreditCard.new(
+      source: :apple_pay,
+      payment_data: {
+        data: 'encrypted-apple-pay-data',
+        signature: 'apple-pay-signature',
+        header: {
+          publicKeyHash: 'apple-pay-public-key-hash',
+          ephemeralPublicKey: 'apple-pay-ephemeral-public-key',
+          transactionId: 'apple-pay-transaction-id'
+        },
+        version: 'EC_v1'
+      }
+    )
+
+    @encrypted_google_pay_card = NetworkTokenizationCreditCard.new(
+      source: :google_pay,
+      payment_data: {
+        protocolVersion: 'ECv2',
+        signature: 'google-pay-signature',
+        intermediateSigningKey: {
+          signedKey: 'google-pay-signed-key',
+          signatures: ['google-pay-intermediate-signature']
+        },
+        signedMessage: 'google-pay-signed-message'
+      }
+    )
+
     @amount = 100
 
     @options = {
@@ -101,7 +128,7 @@ class PinTest < Test::Unit::TestCase
     @gateway.expects(:add_amount).with(instance_of(Hash), @amount, @options)
     @gateway.expects(:add_customer_data).with(instance_of(Hash), @options)
     @gateway.expects(:add_invoice).with(instance_of(Hash), @options)
-    @gateway.expects(:add_payment_method).with(instance_of(Hash), @credit_card)
+    @gateway.expects(:add_payment_method).with(instance_of(Hash), @credit_card, @options)
     @gateway.expects(:add_address).with(instance_of(Hash), @credit_card, @options)
     @gateway.expects(:add_capture).with(instance_of(Hash), @options)
 
@@ -151,6 +178,82 @@ class PinTest < Test::Unit::TestCase
     assert_equal 'ch_4C1Avej4rgK9rBWFnbMMEg', response.authorization
     assert_equal JSON.parse(successful_purchase_response_with_google_pay), response.params
     assert response.test?
+  end
+
+  def test_successful_encrypted_apple_pay_purchase
+    @gateway.expects(:ssl_request).with do |method, url, data, _headers|
+      next false unless method == :post && url == 'https://test-api.pinpayments.com/1/payment_sources'
+
+      json = JSON.parse(data)
+      json['type'] == 'applepay' &&
+        json['source'] == {
+          'data' => 'encrypted-apple-pay-data',
+          'signature' => 'apple-pay-signature',
+          'header' => {
+            'publicKeyHash' => 'apple-pay-public-key-hash',
+            'ephemeralPublicKey' => 'apple-pay-ephemeral-public-key',
+            'transactionId' => 'apple-pay-transaction-id'
+          },
+          'version' => 'EC_v1'
+        }
+    end.returns(successful_payment_token_response_with_apple_pay)
+
+    @gateway.expects(:ssl_request).with do |method, url, data, _headers|
+      method == :post && url == 'https://test-api.pinpayments.com/1/charges' &&
+        JSON.parse(data)['payment_source_token'] == 'ps_ww1kVvBgfAVLOCy-lNBy_Q'
+    end.returns(successful_purchase_response_with_apple_pay)
+
+    assert response = @gateway.purchase(@amount, @encrypted_apple_pay_card, @options)
+    assert_success response
+    assert_equal 'ch_KpX2EKVlZlcjjaAu1gJ_Vg', response.authorization
+  end
+
+  def test_successful_encrypted_google_pay_purchase
+    @gateway.expects(:ssl_request).with do |method, url, data, _headers|
+      next false unless method == :post && url == 'https://test-api.pinpayments.com/1/payment_sources'
+
+      json = JSON.parse(data)
+      json['type'] == 'googlepay' &&
+        json['source'] == {
+          'protocolVersion' => 'ECv2',
+          'signature' => 'google-pay-signature',
+          'intermediateSigningKey' => {
+            'signedKey' => 'google-pay-signed-key',
+            'signatures' => ['google-pay-intermediate-signature']
+          },
+          'signedMessage' => 'google-pay-signed-message'
+        }
+    end.returns(successful_payment_token_response_with_google_pay)
+
+    @gateway.expects(:ssl_request).with do |method, url, data, _headers|
+      method == :post && url == 'https://test-api.pinpayments.com/1/charges' &&
+        JSON.parse(data)['payment_source_token'] == 'ps_5R56xSAmAAI9_f_P1PKgOg'
+    end.returns(successful_purchase_response_with_google_pay)
+
+    assert response = @gateway.purchase(@amount, @encrypted_google_pay_card, @options)
+    assert_success response
+    assert_equal 'ch_4C1Avej4rgK9rBWFnbMMEg', response.authorization
+  end
+
+  def test_purchase_returns_payment_source_failure_without_charging
+    @gateway.expects(:ssl_request).once.with do |method, url, _data, _headers|
+      method == :post && url == 'https://test-api.pinpayments.com/1/payment_sources'
+    end.returns(failed_payment_token_response)
+
+    response = @gateway.purchase(@amount, @encrypted_google_pay_card, @options)
+    assert_failure response
+    assert_equal 'invalid_resource', response.params['error']
+  end
+
+  def test_encrypted_wallet_with_unsupported_source_raises
+    card = NetworkTokenizationCreditCard.new(
+      source: :network_token,
+      payment_data: { data: 'foo' }
+    )
+
+    assert_raises ArgumentError do
+      @gateway.purchase(@amount, card, @options)
+    end
   end
 
   def test_send_platform_adjustment
@@ -241,7 +344,6 @@ class PinTest < Test::Unit::TestCase
   end
 
   def test_successful_inquire
-    post_data = {}
     headers = {}
     token = 'ch_Kw_JxmVqMeSOQU19_krRdw'
     @gateway.stubs(:headers).returns(headers)
@@ -277,7 +379,7 @@ class PinTest < Test::Unit::TestCase
     end_date = '2025-01-31'
     @gateway.expects(:ssl_request).with(:get, "https://test-api.pinpayments.com/1/charges/search?end_date=#{end_date}&start_date=#{start_date}", nil, instance_of(Hash)).returns(successful_transaction_search_response)
 
-    assert response = @gateway.transaction_search(start_date: start_date, end_date: end_date)
+    assert response = @gateway.transaction_search(start_date:, end_date:)
     assert_success response
     assert response.test?
   end
@@ -401,14 +503,14 @@ class PinTest < Test::Unit::TestCase
   end
 
   def test_store_parameters
-    @gateway.expects(:add_payment_method).with(instance_of(Hash), @credit_card)
+    @gateway.expects(:add_payment_method).with(instance_of(Hash), @credit_card, @options)
     @gateway.expects(:add_address).with(instance_of(Hash), @credit_card, @options)
     @gateway.expects(:ssl_request).returns(successful_store_response)
     assert_success @gateway.store(@credit_card, @options)
   end
 
   def test_update_parameters
-    @gateway.expects(:add_payment_method).with(instance_of(Hash), @credit_card)
+    @gateway.expects(:add_payment_method).with(instance_of(Hash), @credit_card, @options)
     @gateway.expects(:add_address).with(instance_of(Hash), @credit_card, @options)
     @gateway.expects(:ssl_request).returns(successful_store_response)
     assert_success @gateway.update('cus_XZg1ULpWaROQCOT5PdwLkQ', @credit_card, @options)
@@ -569,6 +671,10 @@ class PinTest < Test::Unit::TestCase
 
   def test_transcript_scrubbing_with_apple_pay
     assert_equal scrubbed_transcript_with_apple_pay, @gateway.scrub(transcript_with_apple_pay)
+  end
+
+  def test_transcript_scrubbing_with_encrypted_wallets
+    assert_equal scrubbed_transcript_with_encrypted_wallets, @gateway.scrub(transcript_with_encrypted_wallets)
   end
 
   private
@@ -1079,6 +1185,34 @@ class PinTest < Test::Unit::TestCase
       },
       "ip_address": "70.63.124.4"
     }'
+  end
+
+  def failed_payment_token_response
+    '{
+      "error": "invalid_resource",
+      "error_description": "One or more parameters were missing or invalid",
+      "messages": [
+        {
+          "code": "source_signature_invalid",
+          "message": "Source signature is invalid",
+          "param": "source.signature"
+        }
+      ]
+    }'
+  end
+
+  def transcript_with_encrypted_wallets
+    <<~PRE_SCRUBBED
+      <- "{\"type\":\"applepay\",\"source\":{\"data\":\"CpNwka2Dx7Ld/5EeIKxk+8Ze5lfjslhe91BGL3xvvHu5\",\"signature\":\"MIAGCSqGSIb3DQEHAqCAMIACAQExDzANBglghkgBZQ\",\"header\":{\"publicKeyHash\":\"T0Dxmof9nRRQ+LIix3IGkVr6KubE5DtsVVx78oGG/Uc=\",\"ephemeralPublicKey\":\"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEnaHHIn\",\"transactionId\":\"df812fad8a217e5eafad1cdcdf04e521\"},\"version\":\"EC_v1\"}}"
+      <- "{\"type\":\"googlepay\",\"source\":{\"protocolVersion\":\"ECv2\",\"signature\":\"MEYCIQCFH1ytUSUFjzcO2vMiBK0nvIFdxVA1LJ6qQLvZfNlOYg\",\"intermediateSigningKey\":{\"signedKey\":\"{\\\"keyValue\\\":\\\"MFkwEwYHKoZIzj0CAQYI\\\"}\",\"signatures\":[\"MEQCIGf/iD9SRDPW18xSxLTIPey2vIoH8Td9miuDD7Z3OyvT\"]},\"signedMessage\":\"{\\\"encryptedMessage\\\":\\\"wTURe+UL6laT\\\",\\\"tag\\\":\\\"OlmHGjmOZPyB\\\"}\"}}"
+    PRE_SCRUBBED
+  end
+
+  def scrubbed_transcript_with_encrypted_wallets
+    <<~POST_SCRUBBED
+      <- "{\"type\":\"applepay\",\"source\":{\"data\":\"[FILTERED]\",\"signature\":\"[FILTERED]\",\"header\":{\"publicKeyHash\":\"T0Dxmof9nRRQ+LIix3IGkVr6KubE5DtsVVx78oGG/Uc=\",\"ephemeralPublicKey\":\"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEnaHHIn\",\"transactionId\":\"df812fad8a217e5eafad1cdcdf04e521\"},\"version\":\"EC_v1\"}}"
+      <- "{\"type\":\"googlepay\",\"source\":{\"protocolVersion\":\"ECv2\",\"signature\":\"[FILTERED]\",\"intermediateSigningKey\":{\"signedKey\":\"{\\\"keyValue\\\":\\\"MFkwEwYHKoZIzj0CAQYI\\\"}\",\"signatures\":[\"MEQCIGf/iD9SRDPW18xSxLTIPey2vIoH8Td9miuDD7Z3OyvT\"]},\"signedMessage\":\"[FILTERED]\"}}"
+    POST_SCRUBBED
   end
 
   def transcript_with_apple_pay

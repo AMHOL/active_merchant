@@ -28,7 +28,9 @@ module ActiveMerchant # :nodoc:
         add_amount(post, money, options)
         add_customer_data(post, options)
         add_invoice(post, options)
-        add_payment_method(post, payment_method)
+        result = add_payment_method(post, payment_method, options)
+        return result if result.is_a?(Response)
+
         add_address(post, payment_method, options)
         add_capture(post, options)
         add_metadata(post, options)
@@ -43,7 +45,9 @@ module ActiveMerchant # :nodoc:
       def store(payment_method, options = {})
         post = {}
 
-        add_payment_method(post, payment_method)
+        result = add_payment_method(post, payment_method, options)
+        return result if result.is_a?(Response)
+
         add_customer_data(post, options)
         add_address(post, payment_method, options)
         commit(:post, 'customers', post, options)
@@ -122,7 +126,9 @@ module ActiveMerchant # :nodoc:
         post = {}
         token = get_customer_token(token)
 
-        add_payment_method(post, payment_method)
+        result = add_payment_method(post, payment_method, options)
+        return result if result.is_a?(Response)
+
         add_customer_data(post, options)
         add_address(post, payment_method, options)
         commit(:put, "customers/#{CGI.escape(token)}", post, options)
@@ -137,7 +143,10 @@ module ActiveMerchant # :nodoc:
           gsub(%r((Authorization: Basic )\w+), '\1[FILTERED]').
           gsub(/(number\\?":\\?")(\d*)/, '\1[FILTERED]').
           gsub(/(cvc\\?":\\?")(\d*)/, '\1[FILTERED]').
-          gsub(/(cryptogram\\?":\\?")(\w*)/, '\1[FILTERED]')
+          gsub(/(cryptogram\\?":\\?")(\w*)/, '\1[FILTERED]').
+          gsub(/("data\\?":\\?")([^"\\]*)/, '\1[FILTERED]').
+          gsub(/(signature\\?":\\?")([^"\\]*)/, '\1[FILTERED]').
+          gsub(/(signedMessage\\?":\\?")((?:\\+"|[^"])*)/, '\1[FILTERED]')
       end
 
       private
@@ -180,13 +189,17 @@ module ActiveMerchant # :nodoc:
         post[:capture] = capture != false
       end
 
-      def add_payment_method(post, payment_method)
+      def add_payment_method(post, payment_method, options = {})
         return unless payment_method
 
         case payment_method
         when NetworkTokenizationCreditCard
-          get_token = get_single_use_token(payment_method, options)
-          post[:payment_source_token] = get_token.params.dig('response', 'token')
+          token_response = get_single_use_token(payment_method, options)
+          # Surface the payment_sources failure to the caller; charging on with
+          # a nil token yields misleading "card can't be blank" errors instead.
+          return token_response unless token_response.success?
+
+          post[:payment_source_token] = token_response.params.dig('response', 'token')
         when CreditCard
           post[:card] ||= {}
           post[:card].merge!(
@@ -210,7 +223,18 @@ module ActiveMerchant # :nodoc:
       # Get a single use token from Pin for NT based payment methods
       # This is used to create a charge using a network tokenized card
       def get_single_use_token(payment_method, options)
-        post = {
+        post =
+          if payment_method.encrypted_wallet?
+            encrypted_wallet_payment_source(payment_method)
+          else
+            network_token_payment_source(payment_method)
+          end
+
+        commit(:post, 'payment_sources', post, options)
+      end
+
+      def network_token_payment_source(payment_method)
+        {
           type: 'network_token',
           source: {
             number: payment_method.number,
@@ -221,8 +245,45 @@ module ActiveMerchant # :nodoc:
             eci: payment_method.eci
           }
         }
+      end
 
-        commit(:post, 'payment_sources', post, options)
+      # Pin decrypts the wallet payload itself, so the source is the token
+      # exactly as issued by Apple (PKPaymentToken paymentData) or Google
+      # (PaymentMethodTokenizationData token), with its native key names.
+      def encrypted_wallet_payment_source(payment_method)
+        payment_data = payment_method.payment_data.with_indifferent_access
+
+        case payment_method.source
+        when :apple_pay
+          {
+            type: 'applepay',
+            source: {
+              data: payment_data[:data],
+              signature: payment_data[:signature],
+              header: {
+                publicKeyHash: payment_data.dig(:header, :publicKeyHash),
+                ephemeralPublicKey: payment_data.dig(:header, :ephemeralPublicKey),
+                transactionId: payment_data.dig(:header, :transactionId)
+              },
+              version: payment_data[:version]
+            }
+          }
+        when :google_pay
+          {
+            type: 'googlepay',
+            source: {
+              protocolVersion: payment_data[:protocolVersion],
+              signature: payment_data[:signature],
+              intermediateSigningKey: {
+                signedKey: payment_data.dig(:intermediateSigningKey, :signedKey),
+                signatures: payment_data.dig(:intermediateSigningKey, :signatures)
+              },
+              signedMessage: payment_data[:signedMessage]
+            }
+          }
+        else
+          raise ArgumentError, "Unsupported encrypted wallet source: #{payment_method.source}"
+        end
       end
 
       def get_customer_token(token)
